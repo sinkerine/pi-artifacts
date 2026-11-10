@@ -39,6 +39,62 @@ notice.id = "notice";
 notice.setAttribute("role", "status");
 const main = el("main");
 app.append(header, connection, notice, main);
+
+// Keep interactive nodes mounted while metadata/SSE requests finish between keypresses.
+const title = el("h1"),
+  kind = el("span"),
+  label = el("label", "Revision"),
+  select = el("select");
+select.setAttribute("aria-label", "Revision");
+const latest = el("option", "Latest");
+latest.value = "latest";
+select.append(latest);
+const revisionOptions = new Map<number, HTMLOptionElement>();
+select.onchange = () => {
+  state.pinned = select.value !== "latest";
+  state.revision = state.pinned ? Number(select.value) : null;
+  const u = new URL(location.href);
+  if (state.pinned) u.searchParams.set("revision", String(state.revision));
+  else u.searchParams.delete("revision");
+  history.replaceState(null, "", u);
+  void refresh();
+};
+label.append(select);
+const modes = (["preview", "source"] as const).map((mode) => ({
+  mode,
+  node: button(mode === "preview" ? "Preview" : "Source", () => {
+    state.mode = mode;
+    render(false);
+  }),
+}));
+const reload = button("Reload", () => {
+  if (state.mode === "source") sourceView(true);
+  else main.querySelector("iframe")?.contentWindow?.location.reload();
+});
+const open = el("a", "Open preview");
+open.target = "_blank";
+open.rel = "noopener";
+const newerText = el("span", "New revision available ");
+const viewLatest = button("View latest", () => {
+  state.pinned = false;
+  history.replaceState(null, "", location.pathname);
+  void refresh();
+});
+const sourceArea = el("section"),
+  sourceFiles = el("nav"),
+  sourceContent = el("div"),
+  download = el("a", "Download original"),
+  binary = el("p"),
+  pre = el("pre");
+sourceArea.id = "source";
+sourceFiles.id = "files";
+sourceFiles.setAttribute("aria-label", "Source files");
+sourceContent.id = "source-content";
+sourceContent.append(binary, download, pre);
+sourceArea.append(sourceFiles, sourceContent);
+const fileButtons = new Map<string, HTMLButtonElement>();
+let sourceKey = "",
+  sourceGeneration = 0;
 async function json<T>(path: string): Promise<T> {
   const response = await fetch(new URL(path, base));
   if (!response.ok) {
@@ -54,110 +110,80 @@ function error(e: unknown) {
     button("Retry", () => void refresh()),
   );
 }
-function sourceView() {
-  main.querySelector("#source")?.remove();
+function sourceView(force = false) {
+  if (!current) return;
   main.querySelector("iframe")?.setAttribute("hidden", "");
-  const area = el("section");
-  area.id = "source";
-  const list = el("nav");
-  list.id = "files";
-  list.setAttribute("aria-label", "Source files");
-  const content = el("div");
-  content.id = "source-content";
-  area.append(list, content);
-  main.append(area);
-  for (const info of current!.files) {
-    const b = button(info.path, () => {
-      state.source = info.path;
-      sourceView();
-    });
-    b.setAttribute("aria-pressed", String(state.source === info.path));
-    list.append(b);
+  if (!sourceArea.isConnected) main.append(sourceArea);
+  const info = current.files.find((f) => f.path === state.source) ?? current.files[0];
+  state.source = info?.path ?? null;
+  let removedFocus = false;
+  for (const [path, node] of fileButtons) {
+    if (current.files.some((f) => f.path === path)) continue;
+    removedFocus ||= document.activeElement === node;
+    node.remove();
+    fileButtons.delete(path);
   }
-  const info = current!.files.find((f) => f.path === state.source) ?? current!.files[0];
+  for (const file of current.files) {
+    let node = fileButtons.get(file.path);
+    if (!node) {
+      node = button(file.path, () => {
+        state.source = file.path;
+        sourceView();
+      });
+      fileButtons.set(file.path, node);
+      sourceFiles.append(node);
+    }
+    node.setAttribute("aria-pressed", String(state.source === file.path));
+  }
+  if (removedFocus && state.source) fileButtons.get(state.source)?.focus();
   if (!info) return;
-  const url = fileUrl(base, current!.id, current!.revision, info.path);
-  const download = el("a", "Download original");
+  const url = fileUrl(base, current.id, current.revision, info.path);
   download.href = `${url}?download=1`;
-  content.append(download);
-  if (!isText(info.mediaType)) {
-    content.prepend(el("p", `${info.mediaType} · ${info.bytes} bytes`));
+  const key = `${current.revision}/${info.path}`;
+  if (key === sourceKey && !force) return;
+  sourceKey = key;
+  const call = ++sourceGeneration;
+  const text = isText(info.mediaType);
+  binary.hidden = text;
+  pre.hidden = !text;
+  if (!text) {
+    binary.textContent = `${info.mediaType} · ${info.bytes} bytes`;
     return;
   }
-  const pre = el("pre", "Loading source…");
-  content.append(pre);
-  const rev = current!.revision;
+  pre.textContent = "Loading source…";
   fetch(url)
     .then(async (response) => {
       if (!response.ok) throw Error("Source unavailable.");
       return response.text();
     })
     .then((text) => {
-      if (current?.revision === rev && state.source === info.path) pre.textContent = text;
+      if (call === sourceGeneration) pre.textContent = text;
     })
     .catch((e) => {
-      pre.textContent = e.message;
+      if (call === sourceGeneration) pre.textContent = e.message;
     });
 }
 function render(changed: boolean) {
-  header.replaceChildren(home);
   if (!current) return;
-  const title = el("h1", current.title);
-  header.append(title, el("span", current.kind));
-  const label = el("label", "Revision");
-  const select = el("select");
-  select.setAttribute("aria-label", "Revision");
-  const latest = el("option", "Latest");
-  latest.value = "latest";
-  select.append(latest);
+  if (!title.isConnected) header.append(title, kind, label, ...modes.map(({ node }) => node), reload, open);
+  title.textContent = current.title;
+  kind.textContent = current.kind;
   for (const revision of revisions) {
+    if (revisionOptions.has(revision.revision)) continue;
     const option = el("option", `Revision ${revision.revision}`);
     option.value = String(revision.revision);
+    revisionOptions.set(revision.revision, option);
     select.append(option);
   }
-  select.value = state.pinned ? String(state.revision) : "latest";
-  select.onchange = () => {
-    state.pinned = select.value !== "latest";
-    state.revision = state.pinned ? Number(select.value) : null;
-    const u = new URL(location.href);
-    if (state.pinned) u.searchParams.set("revision", String(state.revision));
-    else u.searchParams.delete("revision");
-    history.replaceState(null, "", u);
-    void refresh();
-  };
-  label.append(select);
-  header.append(label);
-  for (const mode of ["preview", "source"] as const) {
-    const b = button(mode === "preview" ? "Preview" : "Source", () => {
-      state.mode = mode;
-      render(false);
-    });
-    b.setAttribute("aria-pressed", String(state.mode === mode));
-    header.append(b);
-  }
-  header.append(
-    button("Reload", () => {
-      if (state.mode === "source") sourceView();
-      else main.querySelector("iframe")?.contentWindow?.location.reload();
-    }),
-  );
-  const open = el("a", "Open preview");
+  const selected = state.pinned ? String(state.revision) : "latest";
+  if (select.value !== selected) select.value = selected;
+  for (const { mode, node } of modes) node.setAttribute("aria-pressed", String(state.mode === mode));
   open.href = fileUrl(base, current.id, current.revision, current.entrypoint, true);
-  open.target = "_blank";
-  open.rel = "noopener";
-  header.append(open);
-  notice.replaceChildren();
   if (state.newer) {
-    notice.append(
-      el("span", "New revision available "),
-      button("View latest", () => {
-        state.pinned = false;
-        history.replaceState(null, "", location.pathname);
-        void refresh();
-      }),
-    );
+    if (!viewLatest.isConnected) notice.replaceChildren(newerText, viewLatest);
   } else if (state.sourceChanged)
     notice.textContent = "Selected source no longer exists; showing entrypoint.";
+  else notice.replaceChildren();
   let frame = main.querySelector("iframe");
   if (!frame || changed) {
     frame?.remove();
@@ -168,7 +194,7 @@ function render(changed: boolean) {
   }
   if (state.mode === "source") sourceView();
   else {
-    main.querySelector("#source")?.remove();
+    sourceArea.remove();
     frame.removeAttribute("hidden");
   }
 }

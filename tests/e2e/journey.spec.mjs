@@ -2,6 +2,7 @@ import { cp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { expect, test } from "@playwright/test";
 import { digestTree, journey } from "../fixtures/journey.mjs";
+import { metadataFocus } from "./focus.mjs";
 
 const svg =
   '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><rect width="24" height="24" fill="red"/></svg>';
@@ -174,10 +175,22 @@ test("E1–E10 / V1 packaged Pi artifacts journey", async ({ browser }) => {
         pinned = await context.newPage();
         await pinned.goto(htmlArtifact.revisionUrl);
         await expect(frame(pinned).getByRole("heading", { name: "Count" })).toBeVisible();
+        const selectedFile = page.getByRole("button", { name: "index.html", exact: true });
+        await selectedFile.click();
+        const fileIdentity = await selectedFile.elementHandle();
+        if (!fileIdentity) throw Error("Missing source file control before SSE publication.");
         const start = Date.now();
         const result = await harness.publish("html", "HTML counter", html("Updated"), htmlArtifact.id);
         expect(result.isError).toBe(false);
         expect(result.artifact.revision).toBe(2);
+        await expect(page.locator("pre")).toContainText("Updated");
+        expect(
+          await fileIdentity.evaluate((node) => node.isConnected && document.activeElement === node),
+          "SSE publication preserves the same focused source file control",
+        ).toBe(true);
+        await fileIdentity.dispose();
+        await page.keyboard.press("Enter");
+        await expect(selectedFile).toBeFocused();
         await page.getByRole("button", { name: "index.html", exact: true }).click();
         await expect(page.locator("pre")).toContainText("Updated");
         expect(Date.now() - start).toBeLessThan(5000);
@@ -198,6 +211,11 @@ test("E1–E10 / V1 packaged Pi artifacts journey", async ({ browser }) => {
         await expect(frame(page).getByRole("heading", { name: "Updated" })).toBeVisible();
         await page.screenshot({ path: join(harness.root, "E4-latest.png") });
       },
+    );
+    await step(
+      "V1 focus regression",
+      "Held metadata preserves control identity, focus and keyboard Source/revision/Preview/Reload/file/download actions",
+      async () => metadataFocus(page, htmlArtifact, html(), html("Updated")),
     );
     await step("E5", "Bundled React/lucide/recharts/Tailwind/local CSS and image work offline", async () => {
       const result = await harness.publish("react", "React libraries", react());
