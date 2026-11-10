@@ -1,0 +1,8 @@
+node_modules
+dist/
+coverage/
+.artifacts-checks/
+test-results/
+playwright-report/
+result
+result-*

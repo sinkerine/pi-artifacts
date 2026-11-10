@@ -1,0 +1,16 @@
+# Render these placeholders with operator configuration; preserve the prefix.
+http:
+  routers:
+    pi-artifacts:
+      rule: "Host(`${ARTIFACTS_HOST}`) && PathPrefix(`${ARTIFACTS_PREFIX}`)"
+      entryPoints: [websecure]
+      tls: {}
+      service: pi-artifacts
+  services:
+    pi-artifacts:
+      loadBalancer:
+        responseForwarding:
+          flushInterval: "-1ms"
+        servers:
+          - url: "${ARTIFACTS_BACKEND}"
+# Attach the operator's authentication middleware here. No buffering middleware.

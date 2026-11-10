@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "bindAddress": "127.0.0.1",
+  "port": 4317,
+  "publicUrl": "https://artifacts.example.test/artifacts/",
+  "serviceUrl": "http://127.0.0.1:4317/artifacts/",
+  "dataDir": "/home/example/.local/share/pi-artifacts",
+  "workDir": "/home/example/.local/state/pi-artifacts/work",
+  "tokenFile": "/home/example/.local/share/pi-artifacts/publish-token",
+  "limits": {"maxFiles":100,"maxTotalBytes":10485760,"maxFileBytes":2097152,"buildTimeoutMs":30000}
+}
