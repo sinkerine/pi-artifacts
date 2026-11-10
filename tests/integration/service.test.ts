@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { readdir, readFile, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -8,9 +8,9 @@ const { startService }: typeof import("../../src/service/server") = await import
   resolve("dist/service/server.js")
 );
 
-import { Store } from "../../src/service/store";
 import type { ArtifactRevision, PublishRequest } from "../../src/shared/contracts";
 import { configuration, publication, root } from "../fixtures/helpers";
+import { serviceProcess } from "../fixtures/service-process";
 
 const cleanup: (() => Promise<void>)[] = [];
 afterEach(async () => {
@@ -105,6 +105,41 @@ describe("I4 SSE reconnect", () => {
   });
 });
 describe("I5 pre-commit failures", () => {
+  it("returns source-relative build guidance without dependency or server paths", async () => {
+    const f = await fixture();
+    const cases = [
+      {
+        source: "import X from 'unapproved';export default X",
+        guidance: /Unsupported import unapproved.*Allowed:/s,
+        location: true,
+      },
+      { source: "export const A=1", guidance: /default/, location: false },
+      {
+        source: "export default function App(){return <broken}",
+        guidance: /Expected|Unexpected|Unterminated/,
+        location: true,
+      },
+      {
+        source:
+          "import X from '/nix/store/test-dependency/node_modules/esbuild/lib/main.js';export default X",
+        guidance: /Missing local import.*explicit file list/s,
+        location: true,
+      },
+    ];
+    for (const { source, guidance, location } of cases) {
+      const response = await f.publish(publication({ "components/main.tsx": source }, { kind: "react" }));
+      expect(response.status).toBe(422);
+      const message: string = (await response.json()).error.message;
+      expect(message).toMatch(guidance);
+      expect(message).toContain("Export a default component");
+      if (location) expect(message).toMatch(/components\/main\.tsx:1:\d+:/);
+      for (const serverPath of ["/nix/store/", "/node_modules/", "esbuild/lib/main.js", process.cwd(), f.dir])
+        expect(message).not.toContain(serverPath);
+      expect(message).not.toMatch(/(?:^|[\s"'(])(?:\/|[A-Za-z]:[\\/])/);
+    }
+    expect((await (await fetch(`${f.service.address}api/artifacts`)).json()).artifacts).toEqual([]);
+    expect(await readdir(join(f.data.dataDir, "staging"))).toEqual([]);
+  });
   it("retains all previous bytes/count for invalid encoding, import/default/TSX, limits and missing entrypoint", async () => {
     const f = await fixture({ limits: { maxFileBytes: 4096, maxTotalBytes: 8192 } });
     const a = (await (
@@ -129,25 +164,58 @@ describe("I5 pre-commit failures", () => {
       expect(await treeDigest(join(f.data.dataDir, "artifacts"))).toEqual(before);
     }
   });
-  it("cancels before commit and reports actual disposable filesystem failure", async () => {
+  for (const target of ["source/index.html", "preview/index.html", "manifest.json"]) {
+    it(`returns HTTP failure and cleans staging when the actual ${target} flush fails`, async () => {
+      const dir = await root(),
+        { path, data } = await configuration(dir);
+      const update = publication({ "index.html": "never committed" });
+      const stage = join(data.dataDir, "staging", update.requestId);
+      const service = await serviceProcess(dir, path, { path: join(stage, target), action: "fail" });
+      cleanup.push(() => service.stop("SIGKILL"));
+      const initial = (await (await service.publish(publication())).json()) as ArtifactRevision;
+      update.id = initial.id;
+      update.parentRevision = 1;
+      const before = await treeDigest(join(data.dataDir, "artifacts"));
+      const response = await service.publish(update);
+      expect(await service.boundary).toMatchObject({ path: join(stage, target), operation: "sync" });
+      expect(response.status).toBe(500);
+      expect(await response.text()).not.toContain(data.dataDir);
+      expect(await readdir(join(data.dataDir, "staging"))).toEqual([]);
+      expect(await treeDigest(join(data.dataDir, "artifacts"))).toEqual(before);
+      expect((await (await fetch(`${service.address}api/artifacts`)).json()).artifacts).toEqual([initial]);
+      expect(
+        (await (await fetch(`${service.address}api/artifacts/${initial.id}`)).json()).revisions,
+      ).toHaveLength(1);
+    });
+  }
+  it("aborts an HTTP publication while an actual staging flush is in progress", async () => {
     const dir = await root(),
-      { data } = await configuration(dir);
-    const store = new Store(data);
-    await store.start();
-    cleanup.push(() => store.close());
-    const a = await store.publish(publication());
+      { path, data } = await configuration(dir);
+    const update = publication({ "index.html": "cancel while staging" });
+    const stage = join(data.dataDir, "staging", update.requestId);
+    const service = await serviceProcess(dir, path, {
+      path: join(stage, "source/index.html"),
+      action: "block",
+    });
+    cleanup.push(() => service.stop("SIGKILL"));
+    const initial = (await (await service.publish(publication())).json()) as ArtifactRevision;
+    Object.assign(update, { id: initial.id, parentRevision: 1 });
     const before = await treeDigest(join(data.dataDir, "artifacts"));
-    const abort = new AbortController();
-    abort.abort();
-    await expect(
-      store.publish(publication({ "index.html": "changed" }, { id: a.id, parentRevision: 1 }), abort.signal),
-    ).rejects.toThrow();
-    await mkdir(join(data.dataDir, "staging", "bad"));
-    await writeFile(join(data.dataDir, "staging", "blocked"), "file");
-    const failure = publication({ "index.html": "changed" }, { id: a.id, parentRevision: 1 });
-    await writeFile(join(data.dataDir, "staging", failure.requestId), "blocks stage directory");
-    await expect(store.publish(failure)).rejects.toMatchObject({ code: "EEXIST" });
+    const controller = new AbortController();
+    const pending = service.publish(update, controller.signal).catch((error: unknown) => error);
+    await service.boundary;
+    expect(await readFile(join(stage, "source/index.html"), "utf8")).toBe("cancel while staging");
+    expect((await (await fetch(`${service.address}api/artifacts`)).json()).artifacts).toEqual([initial]);
+    controller.abort();
+    expect(await pending).toBeInstanceOf(Error);
+    await service.disconnected;
+    service.release();
+    await expect.poll(() => readdir(join(data.dataDir, "staging"))).toEqual([]);
     expect(await treeDigest(join(data.dataDir, "artifacts"))).toEqual(before);
+    expect((await (await fetch(`${service.address}api/artifacts`)).json()).artifacts).toEqual([initial]);
+    expect(
+      (await (await fetch(`${service.address}api/artifacts/${initial.id}`)).json()).revisions,
+    ).toHaveLength(1);
   });
 });
 describe("I6 concurrent commits/ownership/staging", () => {
@@ -172,10 +240,46 @@ describe("I6 concurrent commits/ownership/staging", () => {
     }
     expect((await f.publish({ ...body, title: "conflict" })).status).toBe(409);
     await expect(startService({ configPath: f.path })).rejects.toThrow(/owned/);
-    await mkdir(join(f.data.dataDir, "staging", "interrupted"));
-    await writeFile(join(f.data.dataDir, "staging", "interrupted", "partial"), "not committed");
-    await f.restart();
-    expect(await readdir(join(f.data.dataDir, "staging"))).toEqual([]);
+  });
+  it("recovers an interrupted real publisher and process ownership after SIGKILL", async () => {
+    const dir = await root(),
+      { path, data } = await configuration(dir);
+    const update = publication({ "index.html": "interrupted bytes" });
+    const stage = join(data.dataDir, "staging", update.requestId);
+    const first = await serviceProcess(dir, path, {
+      path: join(stage, "preview/index.html"),
+      action: "block",
+    });
+    cleanup.push(() => first.stop("SIGKILL"));
+    const initial = (await (await first.publish(publication())).json()) as ArtifactRevision;
+    Object.assign(update, { id: initial.id, parentRevision: 1 });
+    const before = await treeDigest(join(data.dataDir, "artifacts"));
+    await expect(serviceProcess(dir, path)).rejects.toThrow(/already owned/);
+    const pending = first.publish(update).catch((error: unknown) => error);
+    await first.boundary;
+    expect(await readFile(join(stage, "source/index.html"), "utf8")).toBe("interrupted bytes");
+    expect(await readFile(join(stage, "preview/index.html"), "utf8")).toContain("interrupted bytes");
+    expect(await readdir(stage)).not.toContain("manifest.json");
+    expect(await treeDigest(join(data.dataDir, "artifacts"))).toEqual(before);
+    expect((await (await fetch(`${first.address}api/artifacts`)).json()).artifacts).toEqual([initial]);
+    await first.stop("SIGKILL");
+    expect(first.proc.signalCode).toBe("SIGKILL");
+    expect(await pending).toBeInstanceOf(Error);
+    expect(await readdir(join(data.dataDir, "staging"))).toEqual([update.requestId]);
+    const restarted = await serviceProcess(dir, path);
+    cleanup.push(() => restarted.stop("SIGKILL"));
+    expect(await readdir(join(data.dataDir, "staging"))).toEqual([]);
+    expect(await treeDigest(join(data.dataDir, "artifacts"))).toEqual(before);
+    expect((await (await fetch(`${restarted.address}api/artifacts`)).json()).artifacts).toEqual([initial]);
+    expect(
+      (await (await fetch(`${restarted.address}api/artifacts/${initial.id}`)).json()).revisions,
+    ).toHaveLength(1);
+    expect((await fetch(`${restarted.address}preview/${initial.id}/2/index.html`)).status).toBe(404);
+    const committed = await restarted.publish(update);
+    expect(committed.status).toBe(200);
+    expect(await committed.json()).toMatchObject({ id: initial.id, revision: 2, parentRevision: 1 });
+    for (const [file, hash] of Object.entries(before))
+      expect((await treeDigest(join(data.dataDir, "artifacts")))[file]).toBe(hash);
   });
 });
 describe("I9 prefixed public authority and authentication", () => {

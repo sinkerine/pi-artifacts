@@ -2,6 +2,8 @@ import { spawn } from "node:child_process";
 import { isolatedEnvironment } from "./environment.mjs";
 
 const group = process.argv[2];
+if (!group || !["unit", "integration", "coverage"].includes(group))
+  throw Error("Expected unit, integration or coverage.");
 const args = ["node_modules/vitest/vitest.mjs", "run", "--configLoader", "runner"];
 if (group === "coverage") args.push("--project", "unit", "--project", "integration", "--coverage");
 else args.push("--project", group);

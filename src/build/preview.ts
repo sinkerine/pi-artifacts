@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { extname, posix } from "node:path";
-import { type BuildResult, context, type Loader } from "esbuild";
+import { type BuildFailure, type BuildResult, context, type Loader } from "esbuild";
 import { marked } from "marked";
 import { type ArtifactKind, fail } from "../shared/contracts";
 
@@ -10,6 +10,24 @@ export const allowedImports = ["react", "react-dom", "lucide-react", "recharts"]
 export const runtimeFeedback = `<script>(function(){function show(e){var box=document.getElementById('pi-artifacts-runtime-error');if(!box){box=document.createElement('aside');box.id='pi-artifacts-runtime-error';box.style.cssText='position:fixed;z-index:2147483647;inset:8px 8px auto;background:#fff1f2;color:#881337;padding:16px;font:14px system-ui;border:2px solid #be123c';document.documentElement.appendChild(box)}box.replaceChildren();var text=document.createElement('pre');text.textContent='Preview error: '+String(e&&e.message||e);box.appendChild(text);var button=document.createElement('button');button.textContent='Reload';button.onclick=function(){location.reload()};box.appendChild(button)}window.addEventListener('error',function(e){show(e.error||e.message)});window.addEventListener('unhandledrejection',function(e){show(e.reason)});window.__artifactError=show})();</script>`;
 function html(body: string, head = "") {
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">${runtimeFeedback}${head}</head><body>${body}</body></html>`;
+}
+// esbuild's formatted Error.message includes plugin stacks and dependency paths.
+// Only structured diagnostic text and captured-source locations belong in responses.
+function buildDiagnostic(error: unknown, files: Map<string, Buffer>): string {
+  const errors = (error as Partial<BuildFailure>)?.errors;
+  if (!Array.isArray(errors)) return "Check the component's default export, TSX syntax and imports.";
+  return errors
+    .map(({ text, location, notes }) => {
+      const captured = [location, ...(notes ?? []).map((note) => note.location)].find(
+        (where) => where && files.has(where.file.replace(/^snapshot:/, "")),
+      );
+      const where = captured
+        ? `${captured.file.replace(/^snapshot:/, "")}:${captured.line}:${captured.column + 1}: `
+        : "";
+      return `${where}${text}`;
+    })
+    .join("\n")
+    .replace(/(^|[\s"'`(=:])(?:[A-Za-z]:[\\/]|\/)[^\s"'`<>),;]*/gm, "$1[server path]");
 }
 export async function buildPreview(
   kind: ArtifactKind,
@@ -163,7 +181,7 @@ export async function buildPreview(
     fail(
       422,
       "BUILD",
-      `React build failed. Export a default component and fix TSX/imports: ${(e as Error).message}`,
+      `React build failed. Export a default component and fix TSX/imports: ${buildDiagnostic(e, files)}`,
     );
   }
 }

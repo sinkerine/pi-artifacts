@@ -1,7 +1,9 @@
 import { mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
+/** @param {string} root */
 export async function isolatedEnvironment(root) {
   root = resolve(root);
+  /** @type {Record<string, string>} */
   const env = {};
   for (const key of [
     "PATH",

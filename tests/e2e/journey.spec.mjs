@@ -5,6 +5,7 @@ import { digestTree, journey } from "../fixtures/journey.mjs";
 
 const svg =
   '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><rect width="24" height="24" fill="red"/></svg>';
+/** @returns {Record<string, string>} */
 const html = (label = "Count") => ({
   "index.html": `<!doctype html><html><head><link rel="stylesheet" href="style.css"></head><body><h1>${label}</h1><button id="counter">0</button><img alt="Local image" src="image.svg"><script src="app.js"></script></body></html>`,
   "style.css": "h1{color:rgb(120, 30, 40)}",
@@ -19,6 +20,7 @@ const react = (
   "style.css": "button{padding:12px}",
   "image.svg": svg,
 });
+/** @param {string} path @returns {Promise<string[]>} */
 async function files(path) {
   const out = [];
   for (const e of await readdir(path, { withFileTypes: true })) {
@@ -27,16 +29,27 @@ async function files(path) {
   }
   return out;
 }
+/** @template {import("../fixtures/journey-types.ts").ToolName} N
+ * @param {import("../fixtures/journey-types.ts").PiRecord[]} records @param {N} name
+ * @returns {import("../fixtures/journey-types.ts").ToolEvent<N>} */
 function tool(records, name) {
   const event = records.findLast((r) => r.type === "tool_execution_end" && r.toolName === name);
   expect(event, `actual ${name} tool event`).toBeTruthy();
-  return event;
+  if (!event?.result) throw Error(`Missing ${name} result`);
+  return /** @type {import("../fixtures/journey-types.ts").ToolEvent<N>} */ (event);
 }
 test("E1–E10 / V1 packaged Pi artifacts journey", async ({ browser }) => {
+  /** @type {Awaited<ReturnType<typeof journey>>} */
   let harness;
-  const steps = [],
-    network = [],
-    consoleLog = [];
+  /** @type {{harness?: Awaited<ReturnType<typeof journey>>, context?: import("@playwright/test").BrowserContext}} */
+  const resources = {};
+  /** @type {{id: string, expected: string, actual: string, durationMs: number}[]} */
+  const steps = [];
+  /** @type {{url: string, resource: string, allowed: boolean}[]} */
+  const network = [];
+  /** @type {{type: string, text: string}[]} */
+  const consoleLog = [];
+  /** @param {string} id @param {string} expected @param {() => Promise<void>} fn */
   const step = async (id, expected, fn) =>
     test.step(id, async () => {
       const start = Date.now();
@@ -44,18 +57,38 @@ test("E1–E10 / V1 packaged Pi artifacts journey", async ({ browser }) => {
         await fn();
         steps.push({ id, expected, actual: "Assertions passed", durationMs: Date.now() - start });
       } catch (e) {
-        steps.push({ id, expected, actual: e.message, durationMs: Date.now() - start });
+        steps.push({
+          id,
+          expected,
+          actual: e instanceof Error ? e.message : String(e),
+          durationMs: Date.now() - start,
+        });
         throw e;
       } finally {
         if (harness) await writeFile(join(harness.root, "steps.json"), JSON.stringify(steps, null, 2));
       }
     });
-  let context, page, pinned, htmlArtifact, reactArtifact, markdownArtifact, sessionSnapshot;
+  /** @type {import("@playwright/test").BrowserContext} */
+  let context;
+  /** @type {import("@playwright/test").Page} */
+  let page;
+  /** @type {import("@playwright/test").Page} */
+  let pinned;
+  /** @type {import("../../src/shared/contracts.ts").ArtifactRevision} */
+  let htmlArtifact;
+  /** @type {import("../../src/shared/contracts.ts").ArtifactRevision} */
+  let reactArtifact;
+  /** @type {import("../../src/shared/contracts.ts").ArtifactRevision} */
+  let markdownArtifact;
+  let sessionSnapshot = "";
+  /** @type {Record<string, string>} */
   const knownDigests = {};
+  /** @param {import("@playwright/test").Page} target */
   const frame = (target) => target.frameLocator("iframe");
   async function saved() {
     return digestTree(join(harness.config.dataDir, "artifacts"));
   }
+  /** @param {Record<string, string>} previous */
   async function unchanged(previous) {
     const next = await saved();
     for (const [path, hash] of Object.entries(previous)) expect(next[path], path).toBe(hash);
@@ -63,7 +96,9 @@ test("E1–E10 / V1 packaged Pi artifacts journey", async ({ browser }) => {
   try {
     await step("E1", "Isolated packaged service health and actual Pi extension loaded", async () => {
       harness = await journey();
+      resources.harness = harness;
       context = await browser.newContext({ viewport: { width: 1440, height: 900 }, colorScheme: "light" });
+      resources.context = context;
       await context.route("**/*", (route) => {
         const u = new URL(route.request().url());
         network.push({
@@ -103,7 +138,7 @@ test("E1–E10 / V1 packaged Pi artifacts journey", async ({ browser }) => {
         expect(tool(result.records, "write").isError).toBe(false);
         expect(
           result.records.some(
-            (r) => r.type === "entry_appended" && r.entry.customType === "pi-artifacts.ref.v1",
+            (r) => r.type === "entry_appended" && r.entry?.customType === "pi-artifacts.ref.v1",
           ),
         ).toBe(true);
         await page.goto(htmlArtifact.previewUrl);
@@ -113,7 +148,7 @@ test("E1–E10 / V1 packaged Pi artifacts journey", async ({ browser }) => {
         expect(
           await frame(page)
             .getByRole("img")
-            .evaluate((img) => img.complete && img.naturalWidth > 0),
+            .evaluate((img) => img instanceof HTMLImageElement && img.complete && img.naturalWidth > 0),
         ).toBe(true);
         await expect(frame(page).getByRole("heading")).toHaveCSS("color", "rgb(120, 30, 40)");
         await page.getByRole("button", { name: "Source", exact: true }).click();
@@ -126,6 +161,7 @@ test("E1–E10 / V1 packaged Pi artifacts journey", async ({ browser }) => {
           p.endsWith("journey-A.jsonl"),
         );
         expect(source).toBeTruthy();
+        if (!source) throw Error("Missing Pi session snapshot.");
         sessionSnapshot = join(harness.root, "session-at-revision-1.jsonl");
         await cp(source, sessionSnapshot);
         Object.assign(knownDigests, await saved());
@@ -183,7 +219,7 @@ test("E1–E10 / V1 packaged Pi artifacts journey", async ({ browser }) => {
       expect(
         await frame(page)
           .locator("img")
-          .evaluate((e) => e.complete && e.naturalWidth > 0),
+          .evaluate((e) => e instanceof HTMLImageElement && e.complete && e.naturalWidth > 0),
       ).toBe(true);
       await page.getByRole("button", { name: "Source", exact: true }).click();
       await expect(page.locator("pre")).toHaveText(react()["main.tsx"]);
@@ -205,7 +241,7 @@ test("E1–E10 / V1 packaged Pi artifacts journey", async ({ browser }) => {
       expect(
         await frame(page)
           .locator("img")
-          .evaluate((e) => e.complete && e.naturalWidth > 0),
+          .evaluate((e) => e instanceof HTMLImageElement && e.complete && e.naturalWidth > 0),
       ).toBe(true);
       await page.getByRole("button", { name: "Source", exact: true }).click();
       await expect(page.locator("pre")).toHaveText(markdown);
@@ -396,7 +432,7 @@ test("E1–E10 / V1 packaged Pi artifacts journey", async ({ browser }) => {
           { width: 1440, height: 900 },
           { width: 390, height: 844 },
         ])
-          for (const colorScheme of ["light", "dark"]) {
+          for (const colorScheme of /** @type {const} */ (["light", "dark"])) {
             await page.setViewportSize(viewport);
             await page.emulateMedia({ colorScheme });
             await page.goto(harness.publicUrl);
@@ -442,11 +478,14 @@ test("E1–E10 / V1 packaged Pi artifacts journey", async ({ browser }) => {
       },
     );
   } finally {
-    if (harness) {
-      await writeFile(join(harness.root, "network.json"), JSON.stringify(network, null, 2));
-      await writeFile(join(harness.root, "browser-console.json"), JSON.stringify(consoleLog, null, 2));
-      await context?.close();
-      await harness.close();
+    if (resources.harness) {
+      await writeFile(join(resources.harness.root, "network.json"), JSON.stringify(network, null, 2));
+      await writeFile(
+        join(resources.harness.root, "browser-console.json"),
+        JSON.stringify(consoleLog, null, 2),
+      );
+      await resources.context?.close();
+      await resources.harness.close();
     }
   }
 });

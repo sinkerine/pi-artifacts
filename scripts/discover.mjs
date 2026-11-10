@@ -1,5 +1,6 @@
 import { readdir, readFile } from "node:fs/promises";
 
+/** @type {Record<string, string[]>} */
 const inventory = {};
 for (const group of ["unit", "integration", "e2e"]) {
   const files = (await readdir(`tests/${group}`)).filter((f) => /\.(test|spec)\.(ts|mjs)$/.test(f));

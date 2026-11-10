@@ -13,7 +13,9 @@ const nixDriver = JSON.parse(
     () => '{"version":"unknown"}',
   ),
 );
-const chromium = execFileSync(process.env.PI_ARTIFACTS_CHROMIUM, ["--version"], { encoding: "utf8" }).trim();
+const executable = process.env.PI_ARTIFACTS_CHROMIUM;
+if (!executable) throw Error("Nix Chromium executable is required.");
+const chromium = execFileSync(executable, ["--version"], { encoding: "utf8" }).trim();
 console.log(
   JSON.stringify(
     {

@@ -4,6 +4,9 @@ import {
   createEventBus,
   createExtensionRuntime,
   type ExtensionContext,
+  ExtensionRunner,
+  ModelRegistry,
+  ModelRuntime,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { Value } from "typebox/value";
@@ -11,6 +14,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import artifacts from "../../extensions/artifacts";
 import { loadExtensionFromFactory } from "../../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/loader.js";
 import { startService } from "../../src/service/server";
+import type { ArtifactRevision } from "../../src/shared/contracts";
 import { branchReferences } from "../../src/shared/refs";
 import { configuration, root } from "../fixtures/helpers";
 
@@ -100,14 +104,71 @@ describe("I1 actual Pi SDK extension registration", () => {
     expect(branchReferences(f.session.getBranch())).toHaveLength(4);
   });
 });
-describe("I7 real branch/fork/clone/compaction and runtime replacement", () => {
-  it("keeps branch-local refs while global latest advances and unrelated/in-memory contexts stay separate", async () => {
+async function freshRuntime(
+  dir: string,
+  manager: SessionManager,
+  reason: "startup" | "new" | "resume" | "fork" | "reload",
+) {
+  const runtime = createExtensionRuntime();
+  const writes: { type: string; data: unknown }[] = [];
+  runtime.appendEntry = (type, data) => {
+    writes.push({ type, data });
+    manager.appendCustomEntry(type, data);
+  };
+  const extension = await loadExtensionFromFactory(artifacts, dir, createEventBus(), runtime);
+  const models = await ModelRuntime.create({
+    authPath: join(dir, "disposable-auth.json"),
+    modelsPath: null,
+    modelsStorePath: join(dir, "model-store.json"),
+    refreshOnCreate: false,
+  });
+  const runner = new ExtensionRunner([extension], runtime, dir, manager, new ModelRegistry(models));
+  const errors: unknown[] = [];
+  runner.onError((error) => errors.push(error));
+  await runner.emit({ type: "session_start", reason });
+  expect(errors).toEqual([]);
+  const context = runner.createToolContext("call", undefined);
+  const invoke = (name: string, input: unknown) =>
+    runner.getToolDefinition(name)!.execute("call", input, undefined, undefined, context);
+  return { runtime, runner, context, invoke, writes, errors };
+}
+describe("I5 real failed tool build diagnostics", () => {
+  it("preserves import/default/TSX guidance without leaking Nix or server paths", async () => {
     const f = await setup();
+    const source = join(f.dir, "diagnostic.tsx");
+    for (const [content, guidance] of [
+      ["import X from 'unapproved';export default X", /Unsupported import unapproved/],
+      ["export const A=1", /default/],
+      ["export default function App(){return <broken}", /diagnostic\.tsx:1:\d+/],
+    ] as const) {
+      await writeFile(source, content);
+      const failure = await f
+        .invoke("artifact_publish", { title: "Invalid", kind: "react", entrypoint: source, files: [source] })
+        .catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(Error);
+      const message = (failure as Error).message;
+      expect(message).toMatch(guidance);
+      expect(message).toContain("Export a default component");
+      for (const serverPath of ["/nix/store/", "node_modules/esbuild/lib/main.js", f.dir, process.cwd()])
+        expect(message).not.toContain(serverPath);
+      expect(branchReferences(f.session.getBranch())).toEqual([]);
+    }
+  });
+});
+describe("I7 real branch/fork/clone/compaction and runtime replacement", () => {
+  it("restores branch refs through fresh new/resume/fork/clone/reload runtimes and rejects stale contexts", async () => {
+    const f = await setup();
+    const active = await freshRuntime(f.dir, f.session, "startup");
     const source = join(f.dir, "a.html");
     await writeFile(source, "one");
     const one = (
-      await f.invoke("artifact_publish", { title: "A", kind: "html", entrypoint: source, files: [source] })
-    ).details as any;
+      await active.invoke("artifact_publish", {
+        title: "A",
+        kind: "html",
+        entrypoint: source,
+        files: [source],
+      })
+    ).details as ArtifactRevision;
     const firstRef = f.session.getLeafId()!;
     f.session.appendMessage({
       role: "assistant",
@@ -128,41 +189,151 @@ describe("I7 real branch/fork/clone/compaction and runtime replacement", () => {
     });
     f.session.appendMessage({ role: "user", content: "next", timestamp: Date.now() });
     await writeFile(source, "two");
-    await f.invoke("artifact_publish", {
+    await active.invoke("artifact_publish", {
       id: one.id,
       title: "A2",
       kind: "html",
       entrypoint: source,
       files: [source],
     });
-    expect((await f.invoke("artifact_get", { id: one.id })).details).toMatchObject({
+    const secondRef = f.session.getLeafId();
+    expect((await active.invoke("artifact_get", { id: one.id })).details).toMatchObject({
       artifact: { revision: 2 },
     });
     f.session.branch(firstRef);
-    for (const handler of f.extension.handlers.get("session_tree") ?? [])
-      await handler({}, f.context("json"));
-    expect((await f.invoke("artifact_get", { id: one.id })).details).toMatchObject({
+    await active.runner.emit({ type: "session_tree", oldLeafId: secondRef, newLeafId: firstRef });
+    expect(active.errors).toEqual([]);
+    expect((await active.invoke("artifact_get", { id: one.id })).details).toMatchObject({
       artifact: { revision: 1 },
+    });
+    expect((await active.invoke("artifact_list", {})).details).toMatchObject({
+      artifacts: [{ id: one.id, revision: 1 }],
     });
     const custom = f.session.appendCustomEntry("preserved", { x: 1 });
     f.session.appendCompaction("summary", custom, 100);
     f.session.appendMessage({ role: "user", content: "persist branch", timestamp: Date.now() });
-    expect(branchReferences(f.session.getBranch())).toEqual([{ id: one.id, revision: 1 }]);
     const branchFile = f.session.createBranchedSession(f.session.getLeafId()!)!;
-    const cloned = SessionManager.open(branchFile);
-    expect(branchReferences(cloned.getBranch())).toEqual([{ id: one.id, revision: 1 }]);
-    const fork = SessionManager.forkFrom(branchFile, f.dir, join(f.dir, "forks"));
-    expect(branchReferences(fork.getBranch())).toEqual([{ id: one.id, revision: 1 }]);
-    const unrelated = SessionManager.inMemory(f.dir);
-    expect((await f.invoke("artifact_list", {}, f.context("print", unrelated))).details).toEqual({
-      artifacts: [],
+    const oldWrites = [...active.writes];
+    const oldEntries = f.session.getEntries();
+    await active.runner.emit({
+      type: "session_shutdown",
+      reason: "resume",
+      targetSessionFile: f.session.getSessionFile()!,
     });
-    await expect(f.invoke("artifact_get", { id: one.id }, f.context("json", unrelated))).rejects.toThrow(
-      "not referenced",
-    );
-    expect((await f.invoke("artifact_get", { id: one.id, revision: 2 })).details).toMatchObject({
+    active.runner.invalidate();
+    const resumedManager = SessionManager.open(f.session.getSessionFile()!);
+    const resumed = await freshRuntime(f.dir, resumedManager, "resume");
+    expect(resumed.runtime).not.toBe(active.runtime);
+    expect(resumed.context === active.context).toBe(false);
+    expect((await resumed.invoke("artifact_list", {})).details).toMatchObject({
+      artifacts: [{ id: one.id, revision: 1 }],
+    });
+    expect((await resumed.invoke("artifact_get", { id: one.id })).details).toMatchObject({
+      artifact: { revision: 1 },
+      sources: [{ text: "one" }],
+    });
+    expect((await resumed.invoke("artifact_get", { id: one.id, revision: 2 })).details).toMatchObject({
       artifact: { revision: 2 },
     });
+    for (const manager of [
+      SessionManager.open(branchFile),
+      SessionManager.forkFrom(branchFile, f.dir, join(f.dir, "forks")),
+    ]) {
+      const copied = await freshRuntime(f.dir, manager, "fork");
+      expect((await copied.invoke("artifact_list", {})).details).toMatchObject({
+        artifacts: [{ id: one.id, revision: 1 }],
+      });
+      expect((await copied.invoke("artifact_get", { id: one.id })).details).toMatchObject({
+        artifact: { revision: 1 },
+      });
+      copied.runner.invalidate();
+    }
+    const unrelated = await freshRuntime(
+      f.dir,
+      SessionManager.create(f.dir, join(f.dir, "unrelated")),
+      "new",
+    );
+    const memory = await freshRuntime(f.dir, SessionManager.inMemory(f.dir), "new");
+    for (const fresh of [unrelated, memory]) {
+      expect((await fresh.invoke("artifact_list", {})).details).toEqual({ artifacts: [] });
+      await expect(fresh.invoke("artifact_get", { id: one.id })).rejects.toThrow("not referenced");
+    }
+    await writeFile(source, "resumed runtime child");
+    const resumedChild = (
+      await resumed.invoke("artifact_publish", {
+        id: one.id,
+        title: "After resume",
+        kind: "html",
+        entrypoint: source,
+        files: [source],
+      })
+    ).details;
+    expect(resumedChild).toMatchObject({ id: one.id, revision: 3, parentRevision: 1 });
+    expect((await resumed.invoke("artifact_get", { id: one.id })).details).toMatchObject({
+      artifact: { revision: 3 },
+      sources: [{ text: "resumed runtime child" }],
+    });
+    const resumedWrites = [...resumed.writes];
+    const reloadEntries = resumedManager.getEntries();
+    await resumed.runner.emit({ type: "session_shutdown", reason: "reload" });
+    resumed.runner.invalidate();
+    const reloadedManager = SessionManager.open(resumedManager.getSessionFile()!);
+    const reloaded = await freshRuntime(f.dir, reloadedManager, "reload");
+    expect((await reloaded.invoke("artifact_list", {})).details).toMatchObject({
+      artifacts: [{ id: one.id, revision: 3 }],
+    });
+    await writeFile(source, "fresh runtime child");
+    const child = (
+      await reloaded.invoke("artifact_publish", {
+        id: one.id,
+        title: "After reload",
+        kind: "html",
+        entrypoint: source,
+        files: [source],
+      })
+    ).details;
+    expect(child).toMatchObject({ id: one.id, revision: 4, parentRevision: 3 });
+    expect((await reloaded.invoke("artifact_get", { id: one.id })).details).toMatchObject({
+      artifact: { revision: 4 },
+      sources: [{ text: "fresh runtime child" }],
+    });
+    expect((await reloaded.invoke("artifact_list", {})).details).toMatchObject({
+      artifacts: [{ id: one.id, revision: 4 }],
+    });
+    await expect(
+      active.invoke("artifact_publish", {
+        id: one.id,
+        title: "stale",
+        kind: "html",
+        entrypoint: source,
+        files: [source],
+      }),
+    ).rejects.toThrow(/stale/);
+    await expect(resumed.invoke("artifact_list", {})).rejects.toThrow(/stale/);
+    expect(active.writes).toEqual(oldWrites);
+    expect(resumed.writes).toEqual(resumedWrites);
+    expect(f.session.getEntries()).toEqual(oldEntries);
+    expect(resumedManager.getEntries()).toEqual(reloadEntries);
+    expect(reloaded.writes).toEqual([{ type: "pi-artifacts.ref.v1", data: { id: one.id, revision: 4 } }]);
+    expect((await unrelated.invoke("artifact_list", {})).details).toEqual({ artifacts: [] });
+    const own = (
+      await unrelated.invoke("artifact_publish", {
+        title: "New session",
+        kind: "html",
+        entrypoint: source,
+        files: [source],
+      })
+    ).details as ArtifactRevision;
+    expect(own.id).not.toBe(one.id);
+    expect((await unrelated.invoke("artifact_get", { id: own.id })).details).toMatchObject({
+      artifact: { id: own.id, revision: 1 },
+    });
+    expect((await unrelated.invoke("artifact_list", {})).details).toMatchObject({
+      artifacts: [{ id: own.id, revision: 1 }],
+    });
+    expect(active.writes).toEqual(oldWrites);
+    expect(resumed.writes).toEqual(resumedWrites);
+    for (const runtime of [active, resumed, reloaded, unrelated, memory]) expect(runtime.errors).toEqual([]);
   });
 });
 describe("I8 byte-preserving restoration outside projects", () => {
